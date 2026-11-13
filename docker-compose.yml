@@ -1,0 +1,58 @@
+services:
+  # 无账号本地演示门户：只提供网页查询与逐层填表
+  portal:
+    build: .
+    image: borehole-ingest:latest
+    container_name: demo-portal
+    command: uvicorn app.portal.server:app --host 0.0.0.0 --port 8000
+    environment:
+      PORTAL_DB: /data/portal.db
+      # 保存后延迟多少毫秒才在查询/详情页可见（演示“延迟入库”）
+      PORTAL_VISIBILITY_DELAY_MS: "2500"
+      # 每次填表保存的基础处理耗时
+      PORTAL_SAVE_DELAY_MS: "300"
+      # none | disconnect | conflict | slow
+      PORTAL_FAIL_MODE: "none"
+      SLOW_EXTRA_MS: "15000"
+    volumes:
+      - portal-data:/data
+    ports:
+      - "8000:8000"
+
+  # 补录 API + Playwright 自动化 + SQLite 任务库
+  api:
+    build: .
+    image: borehole-ingest:latest
+    container_name: ingest-api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8080
+    environment:
+      DB_PATH: /data/worker.db
+      HEADLESS: "true"
+      NAV_TIMEOUT_MS: "15000"
+      # 门户 slow 模式保存约 15s，8s 提交超时将制造“已提交未确认”
+      SUBMIT_TIMEOUT_MS: "8000"
+      VISIBILITY_WAIT_MS: "1500"
+      VISIBILITY_MAX_ATTEMPTS: "3"
+    volumes:
+      - worker-data:/data
+    ports:
+      - "8080:8080"
+    depends_on:
+      - portal
+
+  # 一键演示：延迟入库 / 保存后断线 / 冲突 / 重复并发 / 重启续查
+  demo:
+    image: borehole-ingest:latest
+    build: .
+    profiles: ["demo"]
+    container_name: ingest-demo
+    command: python /srv/demo/demo.py --api http://api:8080 --portal http://portal:8000
+    depends_on:
+      - api
+      - portal
+    environment:
+      HTTP_TIMEOUT: "60"
+
+volumes:
+  portal-data:
+  worker-data:
