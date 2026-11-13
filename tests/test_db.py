@@ -51,3 +51,34 @@ def test_recover_stale_running(tmp_path):
     # 幂等：再次恢复无 RUNNING 可处理
     assert db.recover_stale_running() == 0
     db.close()
+
+
+def test_recover_submitting_row_becomes_query_only(tmp_path):
+    """保存已开始（SUBMITTING）时进程被杀：重启后收敛为 UNCONFIRMED 只查不填。"""
+    db = DB(str(tmp_path / "d.db"))
+    db.create_or_get_task("t1", "http://p/", "sha", "f.csv", ROWS)
+    db.mark_submitting("t1", 1)
+    assert db.get_row("t1", 1)["status"] == states.ROW_SUBMITTING
+    # 即使任务状态没停在 RUNNING（中断发生在两轮之间），行也必须被收敛
+    db.recover_stale_running()
+    row = db.get_row("t1", 1)
+    assert row["status"] == states.ROW_SUBMITTED_UNCONFIRMED
+    assert "只查不填" in (row["detail"] or "")
+    db.close()
+
+
+def test_mark_submitting_guards_terminal_and_unconfirmed(tmp_path):
+    """终态/未确认/冲突行不允许被重新标记为保存中（杜绝重填入口）。"""
+    db = DB(str(tmp_path / "e.db"))
+    db.create_or_get_task("t1", "http://p/", "sha", "f.csv", ROWS)
+    db.update_row("t1", 1, states.ROW_CONFIRMED, detail="已确认")
+    db.mark_submitting("t1", 1)
+    assert db.get_row("t1", 1)["status"] == states.ROW_CONFIRMED
+    db.update_row("t1", 1, states.ROW_SUBMITTED_UNCONFIRMED, detail="未确认")
+    db.mark_submitting("t1", 1)
+    assert db.get_row("t1", 1)["status"] == states.ROW_SUBMITTED_UNCONFIRMED
+    # PENDING 可以正常进入 SUBMITTING
+    db.update_row("t1", 1, states.ROW_PENDING, detail=None)
+    db.mark_submitting("t1", 1)
+    assert db.get_row("t1", 1)["status"] == states.ROW_SUBMITTING
+    db.close()

@@ -18,6 +18,12 @@ services:
       - portal-data:/data
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/').status==200 else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
 
   # 补录 API + Playwright 自动化 + SQLite 任务库
   api:
@@ -33,14 +39,22 @@ services:
       SUBMIT_TIMEOUT_MS: "8000"
       VISIBILITY_WAIT_MS: "1500"
       VISIBILITY_MAX_ATTEMPTS: "3"
+      MAX_RUNTIME_ERRORS: "5"
     volumes:
       - worker-data:/data
     ports:
       - "8080:8080"
     depends_on:
-      - portal
+      portal:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,json,sys; sys.exit(0 if json.load(urllib.request.urlopen('http://localhost:8080/health')).get('status')=='ok' else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
 
-  # 一键演示：延迟入库 / 保存后断线 / 冲突 / 重复并发 / 重启续查
+  # 一键演示：延迟入库 / 保存后断线 / 冲突 / 慢响应超时 / 重复并发 / 重启续查
   demo:
     image: borehole-ingest:latest
     build: .
@@ -48,10 +62,12 @@ services:
     container_name: ingest-demo
     command: python /srv/demo/demo.py --api http://api:8080 --portal http://portal:8000
     depends_on:
-      - api
-      - portal
+      api:
+        condition: service_healthy
+      portal:
+        condition: service_healthy
     environment:
-      HTTP_TIMEOUT: "60"
+      HTTP_TIMEOUT: "90"
 
 volumes:
   portal-data:

@@ -26,9 +26,13 @@ class FakeAutomation:
         self.query_calls = 0
         self.submit_calls = 0
         self.fail_query_times = 0          # 前 N 次查询抛运行时错误
+        self.fail_recheck_times = 0        # 前 N 次“只查不填”续查抛错
         self.disconnect_on_submit = False  # 提交后未确认（但已落库）
         self.slow_visibility = False       # 保存确认但复核暂不可见
+        self.fail_prepare_times = 0        # 前 N 次打开录入页/填字段失败（未点击）
+        self.crash_after_marking = False   # 模拟标记 SUBMITTING 后进程被杀
         self._submitted_hidden: list[dict] = []
+        self._pending: dict | None = None
 
     async def query_layer(self, portal, hole_no, top, bottom):
         from app.worker.automation import AutomationError, QueryResult
@@ -44,13 +48,26 @@ class FakeAutomation:
                    and abs(r["bottom_depth"] - bottom) < 1e-9]
         return QueryResult(found=len(matched), records=[dict(r) for r in matched])
 
-    async def submit_layer(self, portal, hole_no, top, bottom, lithology):
+    async def prepare_submit(self, portal, hole_no, top, bottom, lithology):
+        """阶段一：未点击保存。可注入失败，且失败不得产生任何门户记录。"""
+        from app.worker.automation import FormNotSubmitted
+        if self.fail_prepare_times > 0:
+            self.fail_prepare_times -= 1
+            raise FormNotSubmitted("模拟录入页打不开（未点击保存）")
+        self._pending = {"hole_no": hole_no, "top_depth": float(top),
+                         "bottom_depth": float(bottom), "lithology": lithology}
+
+    async def commit_submit(self):
+        """阶段二：点击保存，门户落库；可注入断线/延迟可见。"""
         from app.worker.automation import SubmitResult
+        assert self._pending is not None, "commit 前必须先 prepare"
         self.submit_calls += 1
-        rec = {"hole_no": hole_no, "top_depth": float(top),
-               "bottom_depth": float(bottom), "lithology": lithology,
+        p = self._pending
+        self._pending = None
+        rec = {"hole_no": p["hole_no"], "top_depth": p["top_depth"],
+               "bottom_depth": p["bottom_depth"], "lithology": p["lithology"],
                "url": f"/layers/fake-{self.submit_calls}"}
-        # 模拟真实门户：数据已落库
+        # 模拟真实门户：点击保存即落库
         self.store.append(rec)
         if self.disconnect_on_submit:
             # 断线只影响首次保存；之后恢复正常（模拟门户临时网络中断）
@@ -65,6 +82,9 @@ class FakeAutomation:
         # 正常模式：立即可见（若此前有隐藏记录，此时也一并到可见时间）
         self._submitted_hidden.clear()
         return SubmitResult(confirmed=True, record_url=rec["url"])
+
+    async def discard_prepared(self):
+        self._pending = None
 
     def reveal_all(self):
         self._submitted_hidden.clear()
@@ -198,12 +218,13 @@ async def test_runtime_error_retries_then_recovers(engine, monkeypatch):
     monkeypatch.setattr("app.config.MAX_RUNTIME_ERRORS", 5)
     fake.fail_query_times = 2
     tid = _make_task(db)
-    # 每次推进每行只尝试一次，失败停行；resume 驱动重试
+    # 每次推进每行只尝试一次，失败停行；resume 驱动重试。
+    # 查询失败发生在点击保存之前，行从未提交，保持 PENDING 可重试
     await eng.process_task(tid)
     assert db.list_rows(tid)[0]["attempts"] == 1
     await eng.process_task(tid)
     first = db.list_rows(tid)[0]
-    assert first["attempts"] == 2 and first["status"] == states.ROW_ERROR
+    assert first["attempts"] == 2 and first["status"] == states.ROW_PENDING
     # 第三次查询恢复，整任务完成
     await eng.process_task(tid)
     assert db.get_task(tid)["status"] == states.TASK_COMPLETED
@@ -264,3 +285,136 @@ async def test_confirmed_rows_never_refilled(engine):
     await eng.process_task(tid)
     assert fake.submit_calls == total_submits
     assert all(r["status"] in states.ROW_TERMINAL for r in db.list_rows(tid))
+
+
+async def test_prepare_failure_keeps_pending_and_retries(engine):
+    """打开录入页/填字段失败（未点击保存）→ 仍是 PENDING，后续可重试填报。"""
+    eng, db, fake = engine
+    fake.fail_prepare_times = 1
+    tid = _make_task(db)
+    await eng.process_task(tid)
+    first = db.list_rows(tid)[0]
+    assert first["status"] == states.ROW_PENDING
+    assert fake.submit_calls == 0  # 保存请求从未发出
+    # 下一轮恢复：录入页正常，整任务完成
+    await eng.process_task(tid)
+    assert db.get_task(tid)["status"] == states.TASK_COMPLETED
+    assert fake.submit_calls == 3
+
+
+async def test_crash_after_submitting_marker_never_refills(engine):
+    """缺陷一回归：标记 SUBMITTING 后进程终止并重启。
+
+    门户已受理但未返回确认；重启后该行必须只查不填——即使查询为空
+    （门户延迟可见），也绝不能重新填报。
+    """
+    eng, db, fake = engine
+    tid = _make_task(db)
+
+    # 手工制造“已标记 SUBMITTING、点击结果未知时进程被硬杀”的持久化现场：
+    # 真实崩溃不会走 except 分支，行就停在 SUBMITTING。
+    db.update_row(tid, 1, states.ROW_PENDING, detail=None)
+    db.mark_submitting(tid, 1, detail="保存进行中，进程随即被杀死")
+    assert db.get_row(tid, 1)["status"] == states.ROW_SUBMITTING
+
+    # 模拟重启：残留 RUNNING 任务重新排队，SUBMITTING 收敛为 UNCONFIRMED
+    db.set_task_status(tid, states.TASK_RUNNING)
+    assert db.recover_stale_running() == 1
+    assert db.list_rows(tid)[0]["status"] == states.ROW_SUBMITTED_UNCONFIRMED
+
+    # 新引擎实例（同 DB），门户暂时查不到（延迟可见）：只查不填，绝不重提
+    eng2 = Engine(db, fake)
+    await eng2.process_task(tid)
+    assert db.list_rows(tid)[0]["status"] == states.ROW_SUBMITTED_UNCONFIRMED
+    assert fake.submit_calls == 0
+    assert db.list_rows(tid)[1]["status"] == states.ROW_PENDING  # 后续行不动
+
+    # 人工核实后门户出现唯一一致记录 → 续查确认，仅后续行产生填报
+    fake.store.append({"hole_no": "ZK-01", "top_depth": 0.0, "bottom_depth": 5.0,
+                       "lithology": "粉质黏土", "url": "/layers/recovered"})
+    await eng2.process_task(tid)
+    assert db.get_task(tid)["status"] == states.TASK_COMPLETED
+    assert db.list_rows(tid)[0]["status"] == states.ROW_CONFIRMED
+    assert fake.submit_calls == 2  # 首行从未重填，仅后两行填报
+
+
+async def test_unconfirmed_query_error_stays_query_only(engine, monkeypatch):
+    """缺陷二回归：未确认行续查时查询报错/超时。
+
+    行必须维持只查不填身份（不退化为 PENDING/ERROR），下一次查询为空
+    也不得被填报；唯一同岩性记录出现后才放行。
+    """
+    eng, db, fake = engine
+    monkeypatch.setattr("app.config.MAX_RUNTIME_ERRORS", 5)
+    fake.disconnect_on_submit = True
+    tid = _make_task(db)
+    await eng.process_task(tid)
+    assert db.list_rows(tid)[0]["status"] == states.ROW_SUBMITTED_UNCONFIRMED
+    base_submits = fake.submit_calls
+
+    # 续查连续报错：状态仍是 UNCONFIRMED，且没有任何重提
+    fake.fail_query_times = 3
+    for _ in range(3):
+        await eng.process_task(tid)
+        assert db.list_rows(tid)[0]["status"] == states.ROW_SUBMITTED_UNCONFIRMED
+        assert fake.submit_calls == base_submits
+    row = db.list_rows(tid)[0]
+    assert row["attempts"] == 3 and "仅续查不重提" in (row["detail"] or "")
+
+    # 查询恢复但仍查无（记录还在延迟窗口）：继续停行，依旧不填
+    await eng.process_task(tid)
+    assert db.list_rows(tid)[0]["status"] == states.ROW_SUBMITTED_UNCONFIRMED
+    assert fake.submit_calls == base_submits
+
+    # 记录可见且岩性一致 → 续查确认，放行后续行
+    fake.reveal_all()
+    await eng.process_task(tid)
+    assert db.get_task(tid)["status"] == states.TASK_COMPLETED
+    assert db.list_rows(tid)[0]["status"] == states.ROW_CONFIRMED
+    assert fake.submit_calls == 3  # 首行未重提，仅后两行填报
+
+
+async def test_submitting_row_duplicate_upload_never_refills(engine):
+    """重复上传/并发驱动同一任务时，SUBMITTING 行走只查不填路径。"""
+    eng, db, fake = engine
+    tid = _make_task(db)
+    db.update_row(tid, 1, states.ROW_SUBMITTING, detail="保存进行中")
+    # 再次推进（等价于重复上传触发的 process_task）
+    await eng.process_task(tid)
+    row = db.list_rows(tid)[0]
+    assert row["status"] in states.ROW_RECHECK_ONLY
+    assert fake.submit_calls == 0
+    # 门户记录延迟可见 → UNCONFIRMED 停行
+    assert row["status"] == states.ROW_SUBMITTED_UNCONFIRMED
+
+
+async def test_recheck_conflict_outcomes_keep_blocking(engine):
+    """只查不填行：查无/多条/岩性不符都停行；唯一同岩性才放行。"""
+    eng, db, fake = engine
+    tid = _make_task(db)
+    db.update_row(tid, 1, states.ROW_SUBMITTED_UNCONFIRMED, detail="已开始保存")
+
+    # 查无 → 维持未确认停行
+    await eng.process_task(tid)
+    assert db.list_rows(tid)[0]["status"] == states.ROW_SUBMITTED_UNCONFIRMED
+    assert db.get_task(tid)["status"] == states.TASK_WAITING
+
+    # 多条 → CONFLICT 停行
+    for i in range(2):
+        fake.store.append({"hole_no": "ZK-01", "top_depth": 0.0, "bottom_depth": 5.0,
+                           "lithology": "粉质黏土", "url": f"/layers/{i}"})
+    await eng.process_task(tid)
+    assert db.list_rows(tid)[0]["status"] == states.ROW_CONFLICT
+
+    # 岩性不符 → 继续 CONFLICT
+    fake.store = [{"hole_no": "ZK-01", "top_depth": 0.0, "bottom_depth": 5.0,
+                   "lithology": "黏土", "url": "/layers/x"}]
+    await eng.process_task(tid)
+    assert db.list_rows(tid)[0]["status"] == states.ROW_CONFLICT
+    assert fake.submit_calls == 0
+
+    # 唯一且同岩性 → 放行，后续行继续处理
+    fake.store[0]["lithology"] = "粉质黏土"
+    await eng.process_task(tid)
+    assert db.get_task(tid)["status"] == states.TASK_COMPLETED
+    assert db.list_rows(tid)[0]["status"] == states.ROW_CONFIRMED

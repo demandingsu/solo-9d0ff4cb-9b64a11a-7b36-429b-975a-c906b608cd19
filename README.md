@@ -15,12 +15,20 @@
 | 多条记录 | 停在该行，后续行不动 | `CONFLICT` |
 | 唯一但岩性不符 | 停在该行，后续行不动 | `CONFLICT` |
 
-**保存可能延迟可见、响应可能中断**，因此：
+**保存可能延迟可见、响应可能中断、进程可能在点击保存前后被杀死**，因此：
 
-- 已点击保存却**未拿到确认**（超时 / 断线 / 重启）→ 行落 `UNCONFIRMED`。
-- 对 `UNCONFIRMED` 行，**恢复时只允许查询，查不到也绝不自动重提**，继续停行等待人工核实。
-- 提交过程（点击保存之前）崩溃不落“已提交”，重启后仍是 `PENDING`，可安全重试。
-- `CONFLICT` / `UNCONFIRMED` 行可通过 `POST .../resume` **续查**：查询变为唯一且岩性一致即解除并继续后续行，否则继续停行。
+- 保存动作拆成两阶段并与持久化状态严格对应：
+  - **打开录入页 / 填写字段失败**：保存请求确定未发出，行保持 `PENDING`/`ERROR`，可安全重试；
+  - **点击保存之前**先把行持久化为 `SUBMITTING`（保存已开始，无法排除已提交）；
+  - 点击后超时 / 断线 / 门户报错 / 进程被杀 → 行落 `UNCONFIRMED`。
+- 凡 `SUBMITTING` / `UNCONFIRMED` 的行，在**超时、查询报错、重复上传、进程重启**后
+  **始终只查不填**：查无记录也绝不自动重提，继续停行等待人工核实或续查。
+- 服务重启时，残留的 `RUNNING` 任务自动重新排队，残留的 `SUBMITTING` 行统一收敛为
+  `UNCONFIRMED`，因此“门户已受理、尚未确认就终止进程再启动”不会产生重复填报。
+- `CONFLICT` / `UNCONFIRMED` 行可通过 `POST .../resume` **续查**：
+  - 唯一记录且岩性一致 → 确认并放行后续行；
+  - 查无 / 多条 / 岩性不符 → 继续停在该行，后续行不动；
+  - 查询本身报错 → 维持只查不填身份停行，下一次续查再试。
 - 已确认（`CONFIRMED`/`SKIPPED`）的行在任何重复、并发、重启场景下都**不会重复填报**。
 
 **重复 / 并发去重**：任务以 `(门户 URL, 文件 SHA-256)` 唯一约束。同一门户收到相同文件的
@@ -38,10 +46,10 @@ app/
   config.py              运行参数（超时、复核次数等，环境变量覆盖）
   main.py                FastAPI：补录/查询/续查 API + 后台工作循环
   worker/
-    states.py            行/任务状态常量与中文说明
-    db.py                SQLite 持久层（任务、逐行状态、崩溃恢复）
+    states.py            行/任务状态常量与中文说明（含 SUBMITTING 只查不填分界）
+    db.py                SQLite 持久层（任务、逐行状态、SUBMITTING 标记与崩溃恢复）
     csvparse.py          CSV 解析校验（中英文表头、UTF-8/GB18030）
-    automation.py        Playwright：仅网页查询与逐层填表
+    automation.py        Playwright：prepare/commit 两阶段网页查询与逐层填表
     engine.py            补录状态机（先查后填、冲突停行、未确认只查不填）
   portal/
     server.py            无账号本地演示门户（延迟入库/断线/冲突/慢响应注入）
@@ -49,7 +57,7 @@ demo/
   layers.csv             中文表头演示数据
   layers_en_header.csv   英文表头演示数据
   demo.py                一键端到端演示脚本
-tests/                   33 个单元/集成测试（假自动化，无需浏览器）
+tests/                   40 个单元/集成测试（假自动化，无需浏览器）
 docker-compose.yml       门户 + 补录 API + 一键演示
 ```
 
@@ -101,7 +109,9 @@ docker compose --profile demo run --rm demo
    → `resume` 续查发现记录已存在并确认；
 4. **岩性冲突**：门户同层异岩性 → 停在首行、后续行保持 `PENDING`，
    续查仍冲突则继续停行，人工核实后续查放行；
-5. **进度查询 / 持久化**：打印任务与逐行计数，并给出重启验证命令。
+5. **慢响应超时**：点击保存后 8s 超时（门户侧约 15s 才响应）→ 只查不填，
+   切回正常后续查确认；并给出 `docker compose restart api` 的重启恢复验证命令；
+6. **进度查询 / 持久化**：打印任务与逐行计数，并给出重启验证命令。
 
 ### 手动制造故障场景
 
@@ -129,10 +139,10 @@ docker compose --profile demo run --rm demo   # 或直接 resume 停行任务
 
 | 变量 | 默认 | 含义 |
 |---|---|---|
-| `SUBMIT_TIMEOUT_MS` | 8000 | 点击保存后等待确认的超时，超时即 `UNCONFIRMED` |
+| `SUBMIT_TIMEOUT_MS` | 8000 | 点击保存后等待确认的超时，超时即 `UNCONFIRMED`（只查不填） |
 | `VISIBILITY_WAIT_MS` / `VISIBILITY_MAX_ATTEMPTS` | 1500 / 3 | 保存确认后查询复核的间隔与次数 |
 | `NAV_TIMEOUT_MS` | 15000 | 页面导航/元素超时 |
-| `MAX_RUNTIME_ERRORS` | 5 | 浏览器运行时错误连续多少次后任务置 `FAILED`（仍可 resume） |
+| `MAX_RUNTIME_ERRORS` | 5 | 连续运行时错误多少次后任务置 `FAILED`（仍可 resume；只查不填行身份不变） |
 | `HEADLESS` | true | Playwright 是否无头 |
 
 ## 六、本地测试（无需浏览器）
@@ -142,5 +152,6 @@ pip install -r requirements.txt   # 测试用假自动化，可不装 playwright
 pytest -q
 ```
 
-33 个测试覆盖：CSV 校验、SQLite 持久化与崩溃恢复、状态机全部分支
-（跳过/填报/冲突/断线未确认/延迟可见/续查/重启不重提/并发去重）、API 与门户行为。
+40 个测试覆盖：CSV 校验、SQLite 持久化与崩溃恢复（含 SUBMITTING 重启收敛）、
+状态机全部分支（跳过/填报/冲突/断线未确认/延迟可见/续查报错不重提/
+保存中崩溃不重填/录入页失败可重试/重启不重提/并发去重）、API 与门户行为。

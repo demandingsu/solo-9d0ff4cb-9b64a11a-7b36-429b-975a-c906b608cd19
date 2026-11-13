@@ -55,9 +55,25 @@ async def test_invalid_depth_rejected(portal):
 async def test_disconnect_persists_but_breaks_body(portal):
     c, srv = portal
     await c.post("/admin/fail-mode", data={"mode": "disconnect"})
-    # 真实 uvicorn 下为连接中断(ReadError)；ASGI 测试传输直接透传生成器异常
-    with pytest.raises((httpx.ReadError, ConnectionResetError, httpx.RemoteProtocolError)):
+    # 真实 uvicorn 下为连接中断(ReadError)；ASGI 测试传输直接透传生成器异常，
+    # 新版 httpx 可能把它包在 ExceptionGroup 中
+    def _contains(exc, types):
+        if isinstance(exc, types):
+            return True
+        for sub in getattr(exc, "exceptions", ()):  # ExceptionGroup
+            if _contains(sub, types):
+                return True
+        cause = getattr(exc, "__cause__", None)
+        return bool(cause and _contains(cause, types))
+
+    try:
         await _save(c, hole="ZK-9")
+        raised = None
+    except BaseException as exc:  # noqa: BLE001 - 需兼容 ExceptionGroup 包装
+        raised = exc
+    assert raised is not None
+    assert _contains(raised, (httpx.ReadError, ConnectionResetError,
+                              httpx.RemoteProtocolError))
     # 数据已落库
     state = (await c.get("/admin/state")).json()
     assert any(x["hole_no"] == "ZK-9" for x in state["layers"])

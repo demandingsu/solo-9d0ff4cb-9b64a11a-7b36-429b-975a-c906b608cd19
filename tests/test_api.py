@@ -12,6 +12,7 @@ class FakeAutomation:
     def __init__(self):
         self.store = []
         self.submits = 0
+        self._pending = None
 
     async def query_layer(self, portal, hole_no, top, bottom):
         from app.worker.automation import QueryResult
@@ -22,14 +23,24 @@ class FakeAutomation:
                    and abs(r["bottom_depth"] - bottom) < 1e-9]
         return QueryResult(found=len(matched), records=matched)
 
-    async def submit_layer(self, portal, hole_no, top, bottom, lithology):
+    async def prepare_submit(self, portal, hole_no, top, bottom, lithology):
+        # 仅填写未点击：暂存数据，门户尚无记录
+        self._pending = {"hole_no": hole_no, "top_depth": float(top),
+                         "bottom_depth": float(bottom), "lithology": lithology}
+
+    async def commit_submit(self):
         from app.worker.automation import SubmitResult
         self.submits += 1
+        p = self._pending
+        self._pending = None
         url = f"/layers/f{self.submits}"
-        self.store.append({"hole_no": hole_no, "top_depth": float(top),
-                           "bottom_depth": float(bottom),
-                           "lithology": lithology, "url": url})
+        self.store.append({"hole_no": p["hole_no"], "top_depth": p["top_depth"],
+                           "bottom_depth": p["bottom_depth"],
+                           "lithology": p["lithology"], "url": url})
         return SubmitResult(confirmed=True, record_url=url)
+
+    async def discard_prepared(self):
+        self._pending = None
 
 CSV = ("孔号,层顶深度,层底深度,岩性\n"
        "ZK-01,0,5,粉质黏土\nZK-01,5,12,细砂\n").encode()

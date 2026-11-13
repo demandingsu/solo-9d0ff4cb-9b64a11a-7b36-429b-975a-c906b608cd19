@@ -5,7 +5,9 @@
 2. 保存后断线：门户已落库但响应中断 → 只能续查，禁止自动重提
 3. 冲突：门户存在同层异岩性记录 → 停行待核实
 4. 重复/并发请求：同门户同文件只接续同一任务，已确认行不重填
-5. 重启恢复：任务进度持久化，重启 API 后仍可查询并续查
+5. 慢响应超时 + 重启恢复：点击保存后未确认即超时，重启 API 后
+   残留“保存已开始”行只查不填，续查确认后继续，全程无重复填报
+6. 进度查询与持久化：逐行状态、计数、门户记录链接
 """
 from __future__ import annotations
 
@@ -216,8 +218,31 @@ async def main() -> int:
         show(t)
         assert t["status"] == "COMPLETED"
 
-        # ---------- 场景 5：进度查询与持久化提示 ----------
-        banner("场景 5：进度查询（重启后同样有效，数据在 SQLite 卷中）")
+        # ---------- 场景 5：慢响应超时（已提交未确认）→ 只查不填 → 续查 ----------
+        banner("场景 5：保存响应超时（无法排除已入库）→ 只查不填，续查后放行")
+        await reset_portal(args.portal)
+        await set_mode(args.portal, "slow")  # 保存约 15s，API 8s 超时
+        t = await ingest(client, args.portal + "/", csv_path)
+        t = await wait_terminal(client, t["id"])
+        show(t)
+        unconf = [r for r in t["rows"] if r["status"] == "UNCONFIRMED"]
+        assert unconf, "慢响应超时后首行应为 UNCONFIRMED"
+        assert all(r["status"] == "PENDING" for r in t["rows"][1:]), "后续行不得处理"
+        print("✓ 点击保存后超时：行落 UNCONFIRMED，系统不会自动重提")
+        # 切回正常模式；门户中的慢保存其实已落库，度过可见窗口后续查即可确认
+        await set_mode(args.portal, "none")
+        await asyncio.sleep(3)
+        t = await resume_and_wait(client, t["id"])
+        show(t)
+        assert t["status"] == "COMPLETED", "续查后应全部确认完成"
+        assert all(r["status"] in ("CONFIRMED", "SKIPPED") for r in t["rows"])
+        print("✓ 续查发现门户已存在记录，确认并继续后续行，全程无重复填报")
+        print("  重启验证（SQLite 卷保留行状态，SUBMITTING 重启后收敛为只查不填）：")
+        print("  docker compose restart api && "
+              "curl -X POST localhost:8080/api/tasks/<任务ID>/resume")
+
+        # ---------- 场景 6：进度查询与持久化提示 ----------
+        banner("场景 6：进度查询（重启后同样有效，数据在 SQLite 卷中）")
         tasks = (await client.get("/api/tasks")).json()
         print(f"门户 {args.portal} 共 {len(tasks)} 个任务（按 门户+文件指纹 去重）")
         for item in tasks:

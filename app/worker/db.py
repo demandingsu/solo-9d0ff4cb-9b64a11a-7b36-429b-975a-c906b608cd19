@@ -1,7 +1,8 @@
 """SQLite 持久层：任务与逐行状态，重启后可继续查询进度。
 
 设计要点：
-- 只持久化稳定状态，不保存“处理中”，进程崩溃后重入不会误认为已提交。
+- “保存已开始”（SUBMITTING）与“已提交未确认”（UNCONFIRMED）都持久化：
+  点击保存前后进程被杀死，重入时也绝不可能把该行当作未提交而重填。
 - (门户, 文件指纹) 唯一约束实现同一门户相同文件的重复/并发请求接续同一任务。
 - 单连接 + 线程锁 + WAL，配合 asyncio 事件循环串行访问，安全且简单。
 """
@@ -13,7 +14,10 @@ import threading
 import time
 from typing import Any
 
-from .states import ROW_PENDING, TASK_QUEUED, TASK_RUNNING
+from .states import (
+    ROW_PENDING, ROW_SUBMITTED_UNCONFIRMED, ROW_SUBMITTING,
+    TASK_QUEUED, TASK_RUNNING,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -154,6 +158,22 @@ class DB:
             )
             self._conn.commit()
 
+    def mark_submitting(self, task_id: str, row_no: int,
+                        detail: str = "保存动作已开始，等待保存确认") -> None:
+        """点击保存前落库：此后任何超时/崩溃都按“无法排除已提交”处理。
+
+        只允许从 PENDING/ERROR（从未保存过）进入 SUBMITTING，
+        终态/未确认/冲突行调用均为无操作，杜绝任何路径上的重复填报。
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE task_rows SET status=?, detail=?, updated_at=? "
+                "WHERE task_id=? AND row_no=? AND status IN (?, ?)",
+                (ROW_SUBMITTING, detail, time.time(),
+                 task_id, row_no, ROW_PENDING, "ERROR"),
+            )
+            self._conn.commit()
+
     def row_counts(self, task_id: str) -> dict[str, int]:
         with self._lock:
             rows = self._conn.execute(
@@ -164,12 +184,25 @@ class DB:
 
     def recover_stale_running(self) -> int:
         """崩溃恢复：上次进程残留的 RUNNING 任务回到 QUEUED。
-        行状态（PENDING/UNCONFIRMED 等）保持不变，重入安全性由行级状态机保证。"""
+
+        同时把停在 SUBMITTING（保存已开始但未见结果）的行升级为
+        UNCONFIRMED：重启后无法排除门户已落库，只能续查、绝不重提。
+        其他行状态（PENDING/UNCONFIRMED/CONFLICT 等）原样保留。
+        """
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE tasks SET status=?, note=?, updated_at=? WHERE status=?",
                 (TASK_QUEUED, "检测到上次运行中断，已重新排队（行进度保留）",
                  time.time(), TASK_RUNNING),
+            )
+            # 即使任务并非 RUNNING（例如中断发生在两轮处理之间），
+            # 残留的 SUBMITTING 行也必须收敛为只查不填。
+            self._conn.execute(
+                "UPDATE task_rows SET status=?, detail=?, updated_at=? "
+                "WHERE status=?",
+                (ROW_SUBMITTED_UNCONFIRMED,
+                 "进程中断时保存已开始且未见确认，重启后按未确认处理（只查不填）",
+                 time.time(), ROW_SUBMITTING),
             )
             self._conn.commit()
             return cur.rowcount
